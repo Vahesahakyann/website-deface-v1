@@ -1,0 +1,25 @@
+services:
+
+  website-deface-monitor:
+
+    build: .
+
+    container_name: website-deface-monitor
+    
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+
+      # Host domain list -> container
+      - ./domains.txt:/app/domains.txt:ro
+
+      # Persistent monitoring data
+      - ./website_data:/app/website_data
+
+    shm_size: "1gb"

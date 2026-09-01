@@ -1,0 +1,336 @@
+# Website Defacement Monitor
+
+A Python-based automated website defacement detection system that continuously monitors websites for unauthorized changes using visual hashing, DOM analysis, and behavioral signals. Runs as a Docker container with scheduled scan cycles and email alerting.
+
+---
+
+## Features
+
+- Continuous monitoring with configurable scan intervals
+- Baseline creation on first scan — only saved on HTTP 200 success
+- Retry logic on failed scans — no false email alerts for downtime
+- 20+ detection signals across visual, structural, and behavioral layers
+- Site-type aware scoring — news/ecommerce sites scored differently from static sites
+- Trusted domain whitelist — filters Google Analytics, live chat widgets, CDNs
+- Comparison screenshots — side-by-side baseline vs latest scan
+- Email alerts via SMTP with comparison image attached
+- Dynamic domain list — edit `domains.txt` without restarting Docker
+- JSON evidence output for each scan
+
+---
+
+## Requirements
+
+- Docker and Docker Compose
+- Gmail account with App Password (for email alerts)
+
+---
+
+## Project Structure
+
+```
+website-deface/
+├── defacement_check.py     # Main monitor script
+├── domains.txt             # List of URLs to monitor
+├── .env                    # Configuration (never commit this)
+├── Dockerfile
+├── docker-compose.yml
+└── website_data/           # Auto-created on first run
+    ├── baselines/          # JSON baseline snapshots
+    ├── baseline_screenshots/
+    ├── screenshots/        # Latest scan screenshots
+    ├── comparisons/        # Side-by-side comparison images
+    ├── evidence/           # Full JSON evidence per site
+    ├── scan_results.json
+    ├── suspicious.json
+    └── likely_defaced.json
+```
+
+---
+
+## Setup
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/youruser/website-deface-monitor.git
+cd website-deface-monitor
+```
+
+### 2. Create your `.env` file
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```env
+# Scan interval in seconds (default: 300 = 5 minutes)
+SCAN_INTERVAL_SECONDS=300
+
+# Max parallel scans
+MAX_CONCURRENT_SCANS=5
+
+# Confidence threshold to send email alert (0-100)
+ALERT_THRESHOLD=60
+
+# Retry failed scans before giving up
+MAX_SCAN_RETRIES=3
+RETRY_DELAY_SECONDS=15
+
+# SMTP email alerts (leave blank to disable)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true
+SMTP_USERNAME=you@gmail.com
+SMTP_PASSWORD=your_app_password
+ALERT_EMAIL=alerts@you.com
+```
+
+> **Gmail setup:** Go to Google Account → Security → 2-Step Verification → App Passwords. Generate a password for "Mail". Use that as `SMTP_PASSWORD`.
+
+### 3. Add websites to monitor
+
+Edit `domains.txt` — one URL per line. Optionally tag site type:
+
+```
+# Static sites — full visual scoring weight
+https://example.com
+https://gov.example.am
+
+# News sites — reduced visual weight (content changes legitimately)
+https://bbc.com  #type:news
+
+# E-commerce — moderate visual weight
+https://shop.example.com  #type:ecommerce
+```
+
+Supported types: `static` (default), `news`, `ecommerce`
+
+> You can add or remove URLs at any time without restarting Docker. The list is re-read at the start of every scan cycle.
+
+### 4. Build and run
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+### 5. Watch logs
+
+```bash
+docker compose logs -f
+```
+
+---
+
+## How It Works
+
+### Scan lifecycle
+
+```
+Cycle starts
+    └── Load domains.txt (fresh read every cycle)
+        └── For each URL (concurrent, up to MAX_CONCURRENT_SCANS):
+            ├── No baseline exists?
+            │   ├── Scan succeeds (HTTP 200) → Save baseline → Done
+            │   └── Scan fails → Skip (try again next cycle)
+            └── Baseline exists?
+                ├── Scan succeeds → Compare → Score → Alert if >= threshold
+                └── Scan fails → Retry up to MAX_SCAN_RETRIES times
+                    ├── Eventually succeeds → Compare → Score → Alert if >= threshold
+                    └── All retries fail → Create comparison image → NO email sent
+Cycle ends → Sleep SCAN_INTERVAL_SECONDS → Repeat
+```
+
+### Detection signals
+
+The monitor scores each site from 0–100%. Signals are grouped by category:
+
+#### Visual
+| Signal | Description |
+|---|---|
+| `MAJOR_VISUAL_CHANGE` | pHash distance ≥ 35 between screenshots |
+| `MODERATE_VISUAL_CHANGE` | pHash distance ≥ 20 |
+| `MINOR_VISUAL_CHANGE` | pHash distance ≥ 10 |
+| `COLOR_SCHEME_REPLACED` | Brand color palette changed ≥ 80% |
+| `COLOR_SCHEME_CHANGED` | Color palette changed ≥ 50% |
+
+#### Identity
+| Signal | Description |
+|---|---|
+| `IDENTITY_LOSS` | `<header>`, `<nav>`, `<footer>`, or logo disappeared |
+| `MULTIPLE_IDENTITY_ELEMENTS_LOST` | 2+ identity elements gone |
+| `LARGE_OVERLAY` | New large fixed-position element covering viewport |
+
+#### Content
+| Signal | Description |
+|---|---|
+| `TITLE_CHANGED` | Full page title replaced |
+| `BRAND_PREFIX_CHANGED` | Brand name portion of title changed (strong signal even on news sites) |
+| `LANGUAGE_SCRIPT_CHANGED` | Dominant text script changed (e.g. Latin → Armenian) |
+| `META_DESCRIPTION_CHANGED` | Meta description changed (INFO only) |
+| `DOM_STRUCTURE_CHANGED` | Structural DOM fingerprint changed (INFO only) |
+
+#### Network
+| Signal | Description |
+|---|---|
+| `NEW_EXTERNAL_DOMAINS` | New resource domains (non-whitelisted) |
+| `NEW_SCRIPT_SRC_DOMAINS` | New `<script src="">` domains (non-whitelisted) |
+| `NEW_IFRAME_EXTERNAL_SRC` | iframes now pointing to new external domains |
+| `NAV_LINKS_NEW_DOMAINS` | Nav links now point to unknown external domains |
+| `UNEXPECTED_DOMAIN_REDIRECT` | Final URL domain differs from baseline |
+| `CANONICAL_DOMAIN_MISMATCH` | Canonical URL points to a different root domain |
+
+#### Injection
+| Signal | Description |
+|---|---|
+| `NEW_IFRAME` | New iframe elements appeared |
+| `NEW_FORM` | New form elements appeared |
+| `FORM_ACTION_EXFILTRATION` | Form posts to an external unknown domain |
+| `ROBOTS_NOINDEX_INJECTED` | noindex meta tag appeared (attacker hiding page) |
+
+#### Correlation bonuses
+Combinations of signals trigger additional points:
+
+| Correlation | Signals combined |
+|---|---|
+| `IDENTITY_VISUAL_CORRELATION` | Identity loss + visual change |
+| `IDENTITY_OVERLAY_CORRELATION` | Identity loss + large overlay |
+| `TITLE_DOMAIN_CORRELATION` | Title change + new external domains |
+| `TITLE_VISUAL_CORRELATION` | Title change + visual change |
+| `LANGUAGE_TITLE_CORRELATION` | Language change + title change |
+| `BRAND_DOMAIN_CORRELATION` | Brand prefix change + new external domains |
+| `FULL_REPLACEMENT_CORRELATION` | External domains + DOM change + visual change |
+| `PHISHING_OVERLAY_CORRELATION` | Full overlay + form exfiltration |
+| `CANONICAL_TITLE_CORRELATION` | Canonical hijack + title change |
+
+### Verdict thresholds
+
+| Confidence | Verdict |
+|---|---|
+| 90–100% | `VERY_LIKELY_DEFACED` |
+| 70–89% | `LIKELY_DEFACED` |
+| 40–69% | `SUSPICIOUS` |
+| 0–39% | `LIKELY_NORMAL` |
+
+Email is sent when confidence ≥ `ALERT_THRESHOLD` (default: 60%).
+
+### Site types and visual scoring
+
+Visual signals are multiplied by a weight based on site type to reduce false positives on dynamic sites:
+
+| Type | Visual weight | Use for |
+|---|---|---|
+| `static` | 1.0 (full) | Government, corporate, hospital sites |
+| `ecommerce` | 0.5 | Online shops with changing product images |
+| `news` | 0.3 | News portals where content changes every hour |
+
+### Trusted domain whitelist
+
+The following categories of domains are whitelisted and never contribute to scoring:
+
+- **Google** — Analytics, Tag Manager, Fonts, Maps, Translate, reCAPTCHA
+- **Cloudflare** — CDN, Insights
+- **Social** — Facebook, Twitter, LinkedIn, Instagram
+- **Live chat** — JivoSite, Tawk.to, OpenWidget, PureChat, ManyChat, Zendesk, Drift, Crisp
+- **Marketing** — Scarab Research, Eventable, Eskimi, Snap (LinkedIn)
+- **CDNs** — jsDelivr, unpkg, Bootstrap CDN, jQuery, DataTables, D3.js
+- **Video** — YouTube, YouTube Privacy-enhanced, Vimeo
+- **Analytics** — Hotjar, Yandex Metrica, New Relic, Segment, Mixpanel
+- **Payments** — Stripe, PayPal
+- **Other** — AddToAny, ShareThis, AddThis, Amazon S3/CloudFront, Gismeteo
+
+---
+
+## Output files
+
+| File | Description |
+|---|---|
+| `website_data/scan_results.json` | All sites from the latest cycle |
+| `website_data/suspicious.json` | Sites scoring ≥ 40% |
+| `website_data/likely_defaced.json` | Sites scoring ≥ 70% |
+| `website_data/evidence/<site>.json` | Full snapshot + analysis per site |
+| `website_data/comparisons/<site>_comparison.png` | Side-by-side screenshot |
+| `website_data/baselines/<site>.json` | Stored baseline snapshot |
+| `website_data/baseline_screenshots/<site>.png` | Baseline screenshot |
+
+---
+
+## Resetting a baseline
+
+If a site legitimately redesigned and you want to re-baseline it:
+
+```bash
+# Reset one site
+rm website_data/baselines/example_com.json
+rm website_data/baseline_screenshots/example_com.png
+
+# Reset all baselines
+rm -rf website_data/baselines/ website_data/baseline_screenshots/
+```
+
+The next scan cycle will create a new baseline automatically.
+
+---
+
+## Full reset
+
+```bash
+docker compose down
+rm -rf website_data/
+docker compose up -d
+```
+
+---
+
+## Environment variables reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `SCAN_INTERVAL_SECONDS` | `300` | Seconds between full scan cycles |
+| `MAX_CONCURRENT_SCANS` | `5` | Max parallel browser tabs |
+| `ALERT_THRESHOLD` | `60` | Min confidence % to send email |
+| `MAX_SCAN_RETRIES` | `3` | Retries on scan failure |
+| `RETRY_DELAY_SECONDS` | `15` | Seconds between retries |
+| `SMTP_HOST` | `smtp.gmail.com` | SMTP server |
+| `SMTP_PORT` | `587` | SMTP port |
+| `SMTP_USE_TLS` | `true` | Use STARTTLS |
+| `SMTP_USERNAME` | | Your email address |
+| `SMTP_PASSWORD` | | App password |
+| `ALERT_EMAIL` | | Alert recipient |
+
+---
+
+## .env.example
+
+```env
+SCAN_INTERVAL_SECONDS=300
+MAX_CONCURRENT_SCANS=5
+ALERT_THRESHOLD=60
+MAX_SCAN_RETRIES=3
+RETRY_DELAY_SECONDS=15
+
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true
+SMTP_USERNAME=
+SMTP_PASSWORD=
+ALERT_EMAIL=
+```
+
+---
+
+## Security notes
+
+- Never commit `.env` to version control — it contains your email credentials
+- Add `.env` to `.gitignore`
+- The monitor uses a headless Chromium browser — keep the Docker image updated
+- Baselines are stored as plaintext JSON — keep the `website_data/` directory access-controlled
+
+---
+
+## License
+
+MIT
